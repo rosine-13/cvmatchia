@@ -11,3 +11,19 @@ public_html/uploads/candidates/*
 # Système
 .DS_Store
 Thumbs.db
+# Ignorer les CV uploadés
+public_html/assets/uploads/
+public_html/uploads/
+
+# Ignorer les fichiers de configuration (contenant mots de passe)
+public_html/includes/config.php
+
+# Python
+python_service/__pycache__/
+python_service/venv/
+*.pyc
+*.pyo
+
+# Fichiers système
+.DS_Store
+Thumbs.db
