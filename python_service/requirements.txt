@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pymysql
+python-docx
+PyPDF2
+pytesseract
+Pillow
+scikit-learn
+pandas
+python-dotenv

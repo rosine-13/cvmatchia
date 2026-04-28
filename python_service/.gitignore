@@ -1,0 +1,13 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+# Fichiers sensibles
+.env
+public_html/includes/config.php
+# CV uploadés
+public_html/uploads/candidates/*
+# Système
+.DS_Store
+Thumbs.db
