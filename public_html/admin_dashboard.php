@@ -14,14 +14,13 @@ $analyzedCVs = $stmt->fetchColumn();
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
-    <title>Dashboard Recruteur</title>
+    <title>Dashboard Recruteur - CVMatch IA</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     <style>
         .result-card { border-left: 5px solid #0d6efd; margin-bottom: 20px; transition: transform 0.2s; }
         .result-card:hover { transform: translateY(-5px); }
         .stat-card { border-radius: 15px; }
-        /* Bouton flottant */
         .chat-floating-btn {
             position: fixed;
             bottom: 30px;
@@ -96,12 +95,12 @@ $analyzedCVs = $stmt->fetchColumn();
         <div id="results" class="row"></div>
     </div>
 
-    <!-- Bouton flottant pour ouvrir l'agent conversationnel -->
+    <!-- Bouton flottant pour l'agent conversationnel -->
     <button class="chat-floating-btn" id="openChatBtn" title="Agent IA conversationnel">
         <i class="fas fa-comment-dots"></i>
     </button>
 
-    <!-- Modal Agent conversationnel (global) -->
+    <!-- Modal Agent conversationnel -->
     <div class="modal fade" id="chatModal" tabindex="-1">
         <div class="modal-dialog">
             <div class="modal-content">
@@ -122,7 +121,7 @@ $analyzedCVs = $stmt->fetchColumn();
         </div>
     </div>
 
-    <!-- Modal Envoyer un email (inchangé) -->
+    <!-- Modal Envoyer un email -->
     <div class="modal fade" id="emailModal" tabindex="-1">
         <div class="modal-dialog">
             <div class="modal-content">
@@ -169,45 +168,62 @@ $analyzedCVs = $stmt->fetchColumn();
             lastQuery = query;
             lastResults = data.results || [];
         });
-function displayResults(results) {
-    const container = document.getElementById('results');
-    if (!results.length) {
-        container.innerHTML = '<div class="alert alert-warning">Aucun candidat trouvé.</div>';
-        return;
-    }
-    let html = '';
-    results.forEach(r => {
-        let expDisplay = r.experience_years_display;
-        if (!expDisplay && r.experience_years !== undefined) {
-            let exp = parseFloat(r.experience_years);
-            expDisplay = (exp === Math.floor(exp)) ? exp.toString() : exp.toFixed(1);
-        }
-        html += `
-            <div class="col-md-6 col-lg-4">
-                <div class="card result-card shadow-sm">
-                    <div class="card-body">
-                        <h5 class="card-title"><i class="fas fa-user-circle text-primary"></i> ${escapeHtml(r.full_name)}</h5>
-                        <p class="card-text">
-                            <strong>Score :</strong> <span class="badge bg-success">${r.score}%</span><br>
-                            <strong>Ville :</strong> ${escapeHtml(r.city)}<br>
-                            <strong>Expérience :</strong> ${escapeHtml(expDisplay || '0')} ans<br>
-                            <strong>Compétences :</strong> ${escapeHtml(r.skills)}<br>
-                        </p>
-                        <div class="d-flex gap-2">
-                            <button class="btn btn-sm btn-info text-white" onclick="openEmailModal(${r.user_id}, '${escapeHtml(r.full_name)}')">
-                                <i class="fas fa-envelope"></i> Contacter
-                            </button>
-                            ${r.file_path ? `<a href="${r.file_path}" target="_blank" class="btn btn-sm btn-secondary"><i class="fas fa-file-pdf"></i> Voir CV</a>` : ''}
+
+        function displayResults(results) {
+            const container = document.getElementById('results');
+            if (!results.length) {
+                container.innerHTML = '<div class="alert alert-warning">Aucun candidat trouvé.</div>';
+                return;
+            }
+            let html = '';
+            results.forEach(r => {
+                let expDisplay = r.experience_years_display;
+                if (!expDisplay && r.experience_years !== undefined) {
+                    let exp = parseFloat(r.experience_years);
+                    expDisplay = (exp === Math.floor(exp)) ? exp.toString() : exp.toFixed(1);
+                }
+                const fullName = r.full_name || 'Candidat';
+                const city = r.city || 'Non renseignée';
+                const skills = r.skills || '';
+                // Données DeepSeek
+                const certifications = r.certifications && Array.isArray(r.certifications) ? r.certifications : [];
+                const resume = r.resume || '';
+                const langueMaternelle = r.langue_maternelle || '';
+                const centresInteret = r.centres_interet && Array.isArray(r.centres_interet) ? r.centres_interet : [];
+                const projets = r.projets_phares && Array.isArray(r.projets_phares) ? r.projets_phares : [];
+                const situation = r.situation_matrimoniale || '';
+
+                html += `
+                    <div class="col-md-6 col-lg-4">
+                        <div class="card result-card shadow-sm">
+                            <div class="card-body">
+                                <h5 class="card-title"><i class="fas fa-user-circle text-primary"></i> ${escapeHtml(fullName)}</h5>
+                                <p class="card-text">
+                                    <strong>Score :</strong> <span class="badge bg-success">${r.score}%</span><br>
+                                    <strong>Ville :</strong> ${escapeHtml(city)}<br>
+                                    <strong>Expérience :</strong> ${escapeHtml(expDisplay || '0')} ans<br>
+                                    <strong>Compétences :</strong> ${escapeHtml(skills)}<br>
+                                    ${certifications.length ? `<strong>Certifications :</strong> ${escapeHtml(certifications.join(', '))}<br>` : ''}
+                                    ${langueMaternelle ? `<strong>Langue maternelle :</strong> ${escapeHtml(langueMaternelle)}<br>` : ''}
+                                    ${centresInteret.length ? `<strong>Centres d'intérêt :</strong> ${escapeHtml(centresInteret.join(', '))}<br>` : ''}
+                                    ${projets.length ? `<strong>Projets phares :</strong> ${escapeHtml(projets.join(', '))}<br>` : ''}
+                                    ${situation ? `<strong>Situation matrimoniale :</strong> ${escapeHtml(situation)}<br>` : ''}
+                                    ${resume ? `<em class="text-muted small">${escapeHtml(resume)}</em><br>` : ''}
+                                </p>
+                                <div class="d-flex gap-2">
+                                    <button class="btn btn-sm btn-info text-white" onclick="openEmailModal(${r.user_id}, '${escapeHtml(fullName)}')">
+                                        <i class="fas fa-envelope"></i> Contacter
+                                    </button>
+                                    ${r.file_path ? `<a href="${r.file_path}" target="_blank" class="btn btn-sm btn-secondary"><i class="fas fa-file-pdf"></i> Voir CV</a>` : ''}
+                                </div>
+                            </div>
                         </div>
                     </div>
-                </div>
-            </div>
-        `;
-    });
-    container.innerHTML = html;
-}
+                `;
+            });
+            container.innerHTML = html;
+        }
 
-        // Ouvre le modal de chat (via bouton flottant)
         function openChatModal() {
             const modal = new bootstrap.Modal(document.getElementById('chatModal'));
             modal.show();
@@ -215,10 +231,8 @@ function displayResults(results) {
             window.currentQuery = lastQuery;
         }
 
-        // Bouton flottant
         document.getElementById('openChatBtn')?.addEventListener('click', openChatModal);
 
-        // Envoi du message au backend
         document.getElementById('btnChatSend')?.addEventListener('click', async () => {
             const userMsg = document.getElementById('chatInput').value;
             if (!userMsg) return;
@@ -241,7 +255,6 @@ function displayResults(results) {
             }
         });
 
-        // Envoi d'email
         function openEmailModal(userId, fullName) {
             document.getElementById('emailUserId').value = userId;
             document.getElementById('emailBody').value = `Bonjour ${fullName},\n\nJe suis intéressé par votre profil...\n\nCordialement.`;
