@@ -1,17 +1,27 @@
 import os
 import json
 import re
-import requests
+import unicodedata
 from datetime import date
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pymysql
 from dotenv import load_dotenv
 from cv_parser import parse_cv_file
 from chat_agent import process_chat_query
+import requests
 
 load_dotenv()
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
@@ -21,57 +31,201 @@ DB_CONFIG = {
 }
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
+# -------------------- PROMPT SYSTÈME --------------------
+DEEPSEEK_SYSTEM_PROMPT = """
+Tu es un expert senior en recrutement avec 15 ans d'expérience en analyse de CVs et en matching candidat/poste.
+
+Ta mission : évaluer avec RIGUEUR et PRÉCISION la pertinence d'un profil candidat par rapport à une recherche de poste.
+
+Tu reçois :
+- La REQUÊTE du recruteur (poste, compétences recherchées, contexte)
+- Le FILTRE optionnel (ville, secteur, langue, niveau d'expérience)
+- Le PROFIL complet du candidat (compétences et expérience déjà extraits par IA)
+
+Retourne UNIQUEMENT ce JSON valide, sans texte avant ou après :
+{
+  "score": <entier 0-100>,
+  "justification": "<2-3 phrases expliquant précisément le score>",
+  "points_forts": "<liste des atouts du profil pour ce poste>",
+  "points_faibles": "<lacunes ou éléments manquants>",
+  "competences_detectees": "<toutes les compétences identifiées dans le CV>",
+  "niveau_experience": "<junior|confirmé|senior|expert>",
+  "recommandation": "<fort recommandé|recommandé|à considérer|non recommandé>"
+}
+
+========================================
+RÈGLE D'EXCLUSION STRICTE (prioritaire)
+========================================
+Si le candidat ne possède AUCUNE des compétences techniques explicitement mentionnées dans la requête (ex: PHP, MySQL, JavaScript, etc.), alors :
+   - score = 0
+   - justification = "Aucune compétence technique demandée détectée"
+   - points_forts = ""
+   - points_faibles = "Profil hors sujet"
+   - niveau_experience = "non applicable"
+   - recommandation = "non recommandé"
+Cette règle prévaut sur tout autre calcul de score.
+
+========================================
+ÉTAPE 1 — ANALYSE DE LA REQUÊTE DU RECRUTEUR
+========================================
+Avant de scorer, tu DOIS extraire et noter en mémoire interne TOUS les critères
+explicitement mentionnés dans la requête ET dans le filtre :
+
+A) GENRE
+   - Si la requête mentionne explicitement un genre (homme, femme, masculin, féminin,
+     monsieur, madame, etc.), ce critère est OBLIGATOIRE et non négociable.
+   - Si le genre du candidat ne correspond pas → score plafonné à 20,
+     recommandation "non recommandé".
+   - Si le genre n'est pas mentionné dans la requête → ignorer ce critère,
+     ne pas pénaliser.
+
+B) ÂGE
+   - Si la requête mentionne un âge précis, une fourchette d'âge, ou un groupe
+     (jeune, senior, moins de X ans, entre X et Y ans, etc.), ce critère est OBLIGATOIRE.
+   - Comparer l'âge du candidat (si disponible dans le profil) avec le critère demandé.
+   - Âge hors fourchette → pénalité selon l'écart :
+     * Écart de 1-3 ans  : -15 points
+     * Écart de 4-7 ans  : -25 points
+     * Écart de 8 ans+   : -40 points
+   - Âge non disponible dans le profil → signaler dans "points_faibles" (-5 points max).
+   - Si l'âge n'est pas mentionné dans la requête → ignorer ce critère.
+
+C) VILLE / LOCALISATION
+   - Si la requête ou le filtre mentionne une ville, une région ou un pays précis
+     (ex: "à Abidjan", "basé à Dakar", "région de Paris", etc.), ce critère est OBLIGATOIRE.
+   - Comparer la ville du candidat avec la localisation demandée.
+   - Appliquer les pénalités suivantes :
+     * Même ville que demandée                        → bonus +10 points
+     * Ville différente dans le même pays             → -20 points
+     * Pays différent mais continent identique        → -30 points
+     * Continent différent                            → -40 points
+   - Ville non renseignée dans le profil candidat → signaler dans "points_faibles"
+     (-10 points max), ne pas appliquer la pénalité maximale.
+   - Si aucune ville n'est mentionnée dans la requête ni dans le filtre → ignorer
+     ce critère, ne pas pénaliser.
+
+D) COMPÉTENCES 
+   - Lister TOUTES les compétences demandées dans la requête (techniques, outils,
+     langues, soft skills).
+   - Pour CHAQUE compétence demandée, vérifier si elle est présente dans le profil.
+   - Compétence OBLIGATOIRE manquante (indiquée par "impératif", "obligatoire",
+     "indispensable") → pénalité -15 points par compétence.
+   - Compétence SOUHAITÉE manquante → pénalité -5 points par compétence.
+   - Tenir compte des synonymes et équivalences
+     (JS = JavaScript, PG = PostgreSQL, ML = Machine Learning, etc.).
+   - Si aucune compétence demandée n'est présente → score plafonné à 25.
+
+E) ANNÉES D'EXPÉRIENCE
+   - Si la requête mentionne une durée d'expérience (ex: "5 ans d'expérience"), ce critère est OBLIGATOIRE.
+   - Appliquer les règles suivantes :
+     * Expérience candidat < minimum demandé :
+       - Écart de 1-2 ans : score plafonné à 50%
+       - Écart de 3-4 ans : disqualifier (score = 0)
+       - Écart de 5 ans+  : disqualifier (score = 0)
+   - Si aucune durée n'est mentionnée dans la requête → ignorer ce critère.
+
+========================================
+ÉTAPE 2 — SCORING DE BASE
+========================================
+Calculer le score de correspondance globale sur les critères métier :
+
+BARÈME :
+- 90-100 : Profil idéal, correspond à tous les critères essentiels
+- 75-89  : Très bon profil, correspondance forte
+- 55-74  : Bon profil, correspondance partielle mais solide
+- 35-54  : Profil moyen, quelques correspondances
+- 15-34  : Profil faible, peu de correspondance
+- 0-14   : Profil hors sujet ou données insuffisantes
+
+RÈGLES SUPPLÉMENTAIRES :
+- Les compétences et années d'expérience ont déjà été extraites automatiquement
+  — les utiliser en priorité.
+- Utiliser le texte brut du CV comme complément si disponible.
+- Un profil junior peut scorer haut si la requête cherche un junior.
+- Ne pas pénaliser un profil uniquement parce qu'il a trop d'expérience
+  (sauf surqualification explicitement refusée).
+
+========================================
+ÉTAPE 3 — APPLICATION DES PÉNALITÉS ET BONUS
+========================================
+Appliquer dans l'ordre suivant :
+
+PÉNALITÉS :
+1.  Genre non correspondant (si demandé)              → score plafonné à 20
+2.  Âge hors fourchette (écart 1-3 ans)               → -15 points
+3.  Âge hors fourchette (écart 4-7 ans)               → -25 points
+4.  Âge hors fourchette (écart 8 ans+)                → -40 points
+5.  Ville différente, même pays (si demandée)         → -20 points
+6.  Pays différent, même continent (si demandée)      → -30 points
+7.  Continent différent (si demandée)                 → -40 points
+8.  Compétence obligatoire manquante                  → -15 points par compétence
+9.  Compétence souhaitée manquante                    → -5 points par compétence
+10. Expérience insuffisante (écart 1-2 ans)           → score plafonné = 50%
+11. Expérience insuffisante (écart 3-4 ans)           → disqualifier (score = 0)
+12. Expérience insuffisante (écart 5 ans+)            → disqualifier (score = 0)
+13. Aucune compétence en lien                         → score plafonné à 25%
+
+BONUS :
+1. Même ville que demandée                            → +10 points
+2. Compétences rares très recherchées                 → +5 à +10 points
+3. Expérience dans le même secteur d'activité         → +5 points
+4. Toutes les compétences obligatoires présentes      → +10 points
+
+Score final = Score de base + Bonus - Pénalités
+Score final doit rester entre 0 et 100.
+
+========================================
+ÉTAPE 4 — DÉTERMINATION DE LA RECOMMANDATION
+========================================
+- Score ≥ 75 et aucun critère bloquant (genre)  → "fort recommandé"
+- Score 55-74                                    → "recommandé"
+- Score 35-54                                    → "à considérer"
+- Score < 35 ou genre non correspondant          → "non recommandé"
+
+========================================
+RÈGLES GÉNÉRALES
+========================================
+- Ne JAMAIS inventer des informations absentes du profil candidat.
+- Si une information est manquante dans le profil, le signaler dans "points_faibles".
+- Être factuel et précis dans la justification.
+- Aucun commentaire avant ou après le JSON.
+""".strip()
+
+# -------------------------------------------------------------------------
+
 def get_db():
     return pymysql.connect(**DB_CONFIG)
 
-# --- Fonctions d'extraction de critères ---
+def normalize_text(text):
+    """Supprime accents et met en minuscules."""
+    text = text.lower()
+    text = unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8')
+    return text
+
+def normalize_city(city):
+    """Normalise un nom de ville : minuscules, sans accents, sans tirets, sans espaces."""
+    if not city:
+        return ""
+    city = normalize_text(city)
+    city = re.sub(r'[^a-z]', '', city)  # garde seulement les lettres
+    return city
+
 def extraire_ville(phrase):
-    villes = ['abidjan', 'yamoussoukro', 'bouaké', 'daloa', 'korhogo', 'san-pedro']
+    villes = ['abidjan', 'yamoussoukro', 'bouake', 'daloa', 'korhogo', 'sanpedro']
+    phrase_norm = normalize_city(phrase)
     for v in villes:
-        if v in phrase.lower():
-            return v.capitalize()
+        if v in phrase_norm:
+            return v
     return None
 
-def extraire_exp_min(phrase):
-    match = re.search(r'(\d+(?:\.\d+)?)\s*(?:ans|années?)', phrase)
-    if match:
-        return float(match.group(1))
-    return None
-
-# --- Analyse DeepSeek (prompt enrichi) ---
 def deepseek_analyse(texte):
+    """Analyse initiale d'un CV pour extraire les champs structurés (utilisée par /parse_cv)."""
     if not DEEPSEEK_API_KEY:
         return None
     url = "https://api.deepseek.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-    prompt = f"""
-Tu es un assistant expert en recrutement. Analyse le CV ci-dessous et réponds UNIQUEMENT en format JSON valide avec les clés suivantes :
-- competences_techniques : liste des compétences techniques (ex: ["PHP", "MySQL", "Docker"])
-- competences_non_techniques : liste des soft skills (ex: ["leadership", "travail en équipe"])
-- experience_annees : nombre total d'années d'expérience (entier, 0 si non trouvé)
-- niveau_etudes : niveau d'études le plus élevé (ex: "Bac+5", "Master")
-- domaine_etudes : domaine principal (ex: "Informatique", "Marketing")
-- langues : liste d'objets avec "langue" et "niveau" (ex: [{{"langue": "français", "niveau": "courant"}}])
-- langue_maternelle : langue maternelle du candidat (ex: "Baoulé", "Français")
-- certifications : liste des certifications (ex: ["CISSP", "Scrum Master"])
-- outils : liste des outils/logiciels maîtrisés (ex: ["Git", "Jira", "Power BI"])
-- localisation : ville ou pays mentionné (ex: "Abidjan")
-- disponibilite : texte sur la disponibilité (ex: "immédiate", "3 mois")
-- resume : résumé court du profil (3-4 phrases)
-- centres_interet : liste des centres d'intérêt (ex: ["sport", "lecture"])
-- projets_phares : liste des projets marquants avec une brève description (max 2 projets)
-- situation_matrimoniale : texte sur la situation matrimoniale (ex: "Célibataire", "Marié(e)")
-
-Réponds uniquement en JSON, sans texte supplémentaire.
-
-CV:
-{texte[:3500]}
-"""
-    payload = {
-        "model": "deepseek-chat",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0
-    }
+    prompt = f"""Analyse le CV et réponds UNIQUEMENT en JSON avec les clés : competences_techniques (liste), certifications (liste), localisation (string), situation_matrimoniale (string), resume (string). CV: {texte[:3000]}"""
+    payload = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0}
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=30)
         r.raise_for_status()
@@ -79,10 +233,9 @@ CV:
         rep = re.sub(r'^```json\s*|\s*```$', '', rep.strip())
         return json.loads(rep)
     except Exception as e:
-        print("Erreur DeepSeek:", e)
+        print("Erreur DeepSeek (analyse):", e)
         return None
 
-# --- Classes Pydantic ---
 class ParseRequest(BaseModel):
     file_path: str
     cv_id: int
@@ -95,30 +248,20 @@ class ChatRequest(BaseModel):
     user_message: str
     current_results_ids: list[int] = []
 
-# --- Endpoint d'extraction ---
 @app.post("/parse_cv")
 async def parse_cv(req: ParseRequest):
     try:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         full_path = os.path.join(base_dir, 'public_html', req.file_path)
-        
         text, skills, exp, edu = parse_cv_file(full_path)
         deep_data = None
         if text and len(text) > 100 and DEEPSEEK_API_KEY:
             deep_data = deepseek_analyse(text)
-            if deep_data:
-                if "competences_techniques" in deep_data:
-                    skills = ", ".join(deep_data["competences_techniques"])
-                if "experience_annees" in deep_data:
-                    exp = str(deep_data["experience_annees"])
         conn = get_db()
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE cvs
-                SET extracted_text=%s, extracted_skills=%s, extracted_experience=%s,
-                    extracted_education=%s, extraction_status='done',
-                    deepseek_analysis=%s
-                WHERE id=%s
+                UPDATE cvs SET extracted_text=%s, extracted_skills=%s, extracted_experience=%s,
+                extracted_education=%s, extraction_status='done', deepseek_analysis=%s WHERE id=%s
             """, (text, skills, exp, edu, json.dumps(deep_data), req.cv_id))
             conn.commit()
         conn.close()
@@ -126,161 +269,129 @@ async def parse_cv(req: ParseRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- Endpoint de recherche (seuil strict et bonus) ---
 @app.post("/search")
 async def search(req: SearchRequest):
     conn = get_db()
     try:
-        query = req.query.strip()
-        if not query:
+        raw_query = req.query.strip()
+        if not raw_query:
             return {"results": []}
 
-        genre = None
-        if re.search(r'\b(homme|masculin)\b', query, re.I):
-            genre = 'M'
-        elif re.search(r'\b(femme|féminin)\b', query, re.I):
-            genre = 'F'
+        # --- FILTRE VILLE ---
+        ville_demandee = extraire_ville(raw_query)
+        if ville_demandee:
+            print(f"Filtrage par ville : {ville_demandee}")
 
-        age_condition = None
-        age_value = None
-        match_age = re.search(r'(moins de|plus de)\s*(\d+)\s*ans', query, re.I)
-        if match_age:
-            age_condition = match_age.group(1).lower()
-            age_value = int(match_age.group(2))
-
-        ville_requise = extraire_ville(query)
-        exp_min = extraire_exp_min(query)
-
-        sql = """
-            SELECT u.id as user_id, u.email, c.full_name, c.city, c.birth_date, c.gender,
-                   c.experience_years, cv.extracted_text, cv.extracted_skills, cv.deepseek_analysis
+        # Récupérer tous les CV analysés
+        cur = conn.cursor(pymysql.cursors.DictCursor)
+        cur.execute("""
+            SELECT u.id as user_id, c.full_name, c.city, c.birth_date, c.gender,
+                   c.experience_years, cv.extracted_text, cv.extracted_skills,
+                   cv.deepseek_analysis
             FROM users u
             JOIN candidates c ON u.id = c.user_id
             JOIN cvs cv ON u.id = cv.user_id
-            WHERE u.role = 'candidate' AND cv.extraction_status = 'done'
-        """
-        params = []
-        if genre:
-            sql += " AND c.gender = %s"
-            params.append(genre)
-        if ville_requise:
-            sql += " AND c.city = %s"
-            params.append(ville_requise.capitalize())
-        if exp_min is not None:
-            sql += " AND c.experience_years >= %s"
-            params.append(exp_min)
+            WHERE u.role = 'candidate' AND cv.extraction_status='done' AND cv.deepseek_analysis IS NOT NULL
+        """)
+        candidates = cur.fetchall()
+        cur.close()
+        conn.close()
 
-        with conn.cursor(pymysql.cursors.DictCursor) as cur:
-            cur.execute(sql, params)
-            candidates = cur.fetchall()
+        # Appliquer le filtre ville (normalisation stricte)
+        if ville_demandee:
+            candidates = [c for c in candidates if c['city'] and normalize_city(c['city']) == ville_demandee]
 
-        today = date.today()
-        filtered_candidates = []
-        for c in candidates:
-            if age_condition and c.get('birth_date'):
-                birth = c['birth_date']
-                age = today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
-                if age_condition == 'moins de' and age >= age_value:
-                    continue
-                if age_condition == 'plus de' and age <= age_value:
-                    continue
-            filtered_candidates.append(c)
+        if not candidates:
+            return {"results": []}
 
-        # Recherche textuelle TF‑IDF avec seuil élevé
-        query_words = set(re.findall(r'\b[a-zà-ÿ0-9]{3,}\b', query.lower()))
-        MIN_MATCH_PROPORTION = 0.6   # 60% des mots doivent être présents
         results = []
-        for c in filtered_candidates:
-            full_text = (c.get('extracted_text', '') + ' ' + c.get('extracted_skills', '')).lower()
-            doc_words = set(re.findall(r'\b[a-zà-ÿ0-9]{3,}\b', full_text))
-            if query_words:
-                common = query_words.intersection(doc_words)
-                proportion = len(common) / len(query_words)
-                if proportion < MIN_MATCH_PROPORTION:
-                    continue
-                score = round(proportion * 100, 2)
-            else:
+        today = date.today()
+        for cand in candidates:
+            deep = json.loads(cand['deepseek_analysis']) if cand['deepseek_analysis'] else {}
+
+            age = None
+            if cand.get('birth_date'):
+                birth = cand['birth_date']
+                age = today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
+
+            profil = {
+                "genre": cand.get('gender') or "",
+                "age": age if age is not None else "",
+                "ville": cand.get('city') or "",
+                "experience_annees": cand.get('experience_years') or 0,
+                "competences_techniques": deep.get('competences_techniques', []),
+                "certifications": deep.get('certifications', []),
+                "situation_matrimoniale": deep.get('situation_matrimoniale', ''),
+                "localisation": deep.get('localisation', ''),
+                "resume": deep.get('resume', ''),
+                "texte_brut": cand.get('extracted_text', '')[:1500]
+            }
+
+            user_message = f"""
+REQUÊTE DU RECRUTEUR : {raw_query}
+
+FILTRE optionnel : (aucun pour l'instant)
+
+PROFIL CANDIDAT :
+- Genre : {profil['genre'] if profil['genre'] else 'Non spécifié'}
+- Âge : {profil['age'] if profil['age'] else 'Non renseigné'}
+- Ville : {profil['ville'] if profil['ville'] else 'Non renseignée'}
+- Années d'expérience : {profil['experience_annees']}
+- Compétences techniques : {', '.join(profil['competences_techniques'])}
+- Certifications : {', '.join(profil['certifications'])}
+- Situation matrimoniale : {profil['situation_matrimoniale']}
+- Localisation : {profil['localisation']}
+- Résumé : {profil['resume']}
+- Extrait texte brut : {profil['texte_brut']}
+"""
+
+            payload = {
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message}
+                ],
+                "temperature": 0,
+                "response_format": {"type": "json_object"}
+            }
+            headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+            try:
+                r = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=60)
+                r.raise_for_status()
+                response_text = r.json()["choices"][0]["message"]["content"]
+                response_text = re.sub(r'^```json\s*|\s*```$', '', response_text.strip())
+                score_data = json.loads(response_text)
+            except Exception as e:
+                print(f"Erreur scoring pour {cand['full_name']}: {e}")
                 continue
 
-            # Bonus DeepSeek
-            deep_json = None
-            if c.get('deepseek_analysis') and c['deepseek_analysis'] not in (None, 'null'):
-                try:
-                    deep_json = json.loads(c['deepseek_analysis'])
-                except:
-                    pass
-
-            bonus = 0
-            if deep_json:
-                # Bonus compétences techniques
-                tech_skills = deep_json.get('competences_techniques', [])
-                req_words_lower = [w.lower() for w in query.split()]
-                match_tech = sum(1 for skill in tech_skills if any(w in skill.lower() for w in req_words_lower))
-                bonus += match_tech * 5
-
-                # Bonus certifications
-                certs = deep_json.get('certifications', [])
-                bonus += min(len(certs) * 3, 15)
-
-                # Bonus localisation
-                if ville_requise and deep_json.get('localisation') and ville_requise.lower() in deep_json['localisation'].lower():
-                    bonus += 10
-
-                # Bonus anglais
-                if 'anglais' in query.lower():
-                    langues = deep_json.get('langues', [])
-                    if any('anglais' in l['langue'].lower() for l in langues):
-                        bonus += 5
-
-                # Bonus expérience
-                if exp_min:
-                    ann_cv = int(deep_json.get('experience_annees', 0))
-                    if ann_cv >= exp_min:
-                        bonus += min((ann_cv - exp_min) * 2, 10)
-
-                # Bonus langue maternelle
-                langue_maternelle = deep_json.get('langue_maternelle', '')
-                if langue_maternelle and langue_maternelle.lower() in query.lower():
-                    bonus += 5
-
-                # Bonus centres d'intérêt
-                centres = deep_json.get('centres_interet', [])
-                if centres and any(ci.lower() in query.lower() for ci in centres):
-                    bonus += 5
-
-                # Bonus projets phares
-                projets = deep_json.get('projets_phares', [])
-                if projets and any(p.lower() in query.lower() for p in projets if isinstance(p, str)):
-                    bonus += 5
-
-            score = min(score + bonus, 100)
+            score = score_data.get('score', 0)
+            if score < 20:
+                continue
 
             results.append({
-                "user_id": c['user_id'],
-                "full_name": c['full_name'],
+                "user_id": cand['user_id'],
+                "full_name": cand['full_name'],
                 "score": score,
-                "city": c['city'],
-                "skills": c.get('extracted_skills', ''),
-                "experience_years": c.get('experience_years', 0),
-                "experience_years_display": str(int(c['experience_years'])) if c['experience_years'] == int(c['experience_years']) else str(c['experience_years']),
-                "localisation": deep_json.get('localisation') if deep_json else None,
-                "certifications": deep_json.get('certifications') if deep_json else [],
-                "resume": deep_json.get('resume') if deep_json else None,
-                "langue_maternelle": deep_json.get('langue_maternelle') if deep_json else None,
-                "centres_interet": deep_json.get('centres_interet') if deep_json else [],
-                "projets_phares": deep_json.get('projets_phares') if deep_json else [],
-                "situation_matrimoniale": deep_json.get('situation_matrimoniale') if deep_json else None
+                "justification": score_data.get('justification', ''),
+                "points_forts": score_data.get('points_forts', ''),
+                "points_faibles": score_data.get('points_faibles', ''),
+                "competences_detectees": score_data.get('competences_detectees', ''),
+                "niveau_experience": score_data.get('niveau_experience', ''),
+                "recommandation": score_data.get('recommandation', ''),
+                "city": cand.get('city', 'Non renseignée'),
+                "skills": ", ".join(profil['competences_techniques']),
+                "experience_years": profil['experience_annees'],
+                "experience_years_display": str(int(profil['experience_annees'])) if profil['experience_annees'] == int(profil['experience_annees']) else str(profil['experience_annees']),
+                "resume": profil['resume']
             })
 
         results.sort(key=lambda x: x['score'], reverse=True)
-        return {"results": results[:20]}
+        return {"results": results}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
 
-# --- Agent conversationnel ---
 @app.post("/chat")
 async def chat(req: ChatRequest):
     return process_chat_query(req.original_query, req.user_message, req.current_results_ids)

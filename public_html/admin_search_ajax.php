@@ -10,29 +10,54 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         echo json_encode(['error' => 'Requête vide']);
         exit;
     }
-    $result = callPythonAPI('/search', ['query' => $query]);
-    
-    if (isset($result['results']) && is_array($result['results']) && !empty($result['results'])) {
-        // Récupérer les IDs des candidats
+
+    // Appel direct à l'API Python (FastAPI)
+    $ch = curl_init(PYTHON_API_URL . '/search');
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode(['query' => $query]));
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($httpCode !== 200) {
+        echo json_encode(['error' => "Erreur API Python (HTTP $httpCode)", 'details' => $response]);
+        exit;
+    }
+
+    $result = json_decode($response, true);
+    if (!is_array($result)) {
+        echo json_encode(['error' => 'Réponse JSON invalide', 'raw' => $response]);
+        exit;
+    }
+
+    // Si l'API a retourné une clé "results", on la garde ; sinon on encapsule
+    if (!isset($result['results'])) {
+        // Si c'est déjà un tableau, on le retourne tel quel (certaines versions retournent directement le tableau)
+        $result = ['results' => $result];
+    }
+
+    // Ajout du chemin du CV (optionnel)
+    if (!empty($result['results'])) {
         $userIds = array_column($result['results'], 'user_id');
-        $placeholders = implode(',', array_fill(0, count($userIds), '?'));
-        // Chercher le chemin du CV le plus récent pour chaque candidat
-        $stmt = $pdo->prepare("SELECT user_id, file_path FROM cvs WHERE user_id IN ($placeholders) ORDER BY upload_date DESC");
-        $stmt->execute($userIds);
-        $paths = [];
-        while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-            if (!isset($paths[$row['user_id']])) {
-                $paths[$row['user_id']] = $row['file_path'];
+        if (!empty($userIds)) {
+            $placeholders = implode(',', array_fill(0, count($userIds), '?'));
+            $stmt = $pdo->prepare("SELECT user_id, file_path FROM cvs WHERE user_id IN ($placeholders) ORDER BY upload_date DESC");
+            $stmt->execute($userIds);
+            $paths = [];
+            while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+                if (!isset($paths[$row['user_id']])) {
+                    $paths[$row['user_id']] = $row['file_path'];
+                }
+            }
+            foreach ($result['results'] as &$candidate) {
+                $uid = $candidate['user_id'];
+                $candidate['file_path'] = $paths[$uid] ?? null;
             }
         }
-        foreach ($result['results'] as &$candidate) {
-            $uid = $candidate['user_id'];
-            $candidate['file_path'] = $paths[$uid] ?? null;
-            // Formatage de l'expérience (supprimer .0)
-            $candidate['experience_years_display'] = formatExperience($candidate['experience_years'] ?? 0);
-        }
     }
-    
+
     echo json_encode($result);
 }
 ?>

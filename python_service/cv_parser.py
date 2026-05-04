@@ -1,48 +1,76 @@
 import os
 import re
-from docx import Document
-import PyPDF2
+import docx
 from PIL import Image
 import pytesseract
+import pdfplumber
 
-def parse_pdf(path):
+# Optionnel : si Tesseract n'est pas dans le PATH, indiquez son chemin
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+def parse_pdf(filepath):
+    """Extraction de texte d'un PDF avec pdfplumber"""
     text = ""
-    with open(path, 'rb') as f:
-        reader = PyPDF2.PdfReader(f)
-        for page in reader.pages:
-            text += page.extract_text() + "\n"
+    try:
+        with pdfplumber.open(filepath) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+    except Exception as e:
+        print(f"Erreur pdfplumber pour {filepath}: {e}")
     return text
 
-def parse_docx(path):
-    doc = Document(path)
-    return "\n".join([p.text for p in doc.paragraphs])
+def parse_docx(filepath):
+    text = ""
+    try:
+        doc = docx.Document(filepath)
+        for para in doc.paragraphs:
+            text += para.text + "\n"
+    except Exception as e:
+        print(f"Erreur lecture DOCX {filepath}: {e}")
+    return text
 
-def parse_image(path):
-    img = Image.open(path)
-    return pytesseract.image_to_string(img, lang='fra')
+def parse_image(filepath):
+    try:
+        img = Image.open(filepath)
+        text = pytesseract.image_to_string(img, lang='fra')
+        return text
+    except Exception as e:
+        print(f"Erreur lecture image {filepath}: {e}")
+        return ""
 
-def extract_skills(text):
-    skill_list = ["PHP", "Python", "MySQL", "PowerBI", "JavaScript", "React", "Java", "C++", 
-                  "Gestion de projet", "Agile", "Machine Learning", "HTML", "CSS", "Laravel", 
-                  "Symfony", "Node.js", "Django", "Flask", "SQL", "NoSQL"]
-    found = [kw for kw in skill_list if re.search(r'\b' + re.escape(kw) + r'\b', text, re.I)]
-    return ", ".join(found)
+def extract_skills_experience_education(text):
+    """Extraction basique par mots-clés (gardée pour compatibilité)"""
+    skills_keywords = [
+        'python', 'php', 'mysql', 'postgresql', 'mongodb', 'javascript', 'html', 'css',
+        'react', 'angular', 'vue', 'nodejs', 'django', 'flask', 'laravel', 'symfony',
+        'java', 'c++', 'c#', 'go', 'rust', 'powerbi', 'tableau', 'excel', 'git', 'docker',
+        'kubernetes', 'aws', 'azure', 'gcp', 'agile', 'scrum', 'jenkins', 'jira'
+    ]
+    found = [kw for kw in skills_keywords if kw in text.lower()]
+    skills = ", ".join(found) if found else "Aucune compétence spécifique détectée"
+    
+    exp_match = re.search(r'(\d+)\s*(?:ans|années?|years?)', text, re.IGNORECASE)
+    experience = exp_match.group(1) if exp_match else "0"
+    
+    edu_keywords = ['licence', 'master', 'baccalauréat', 'bac+', 'doctorat', 'ingénieur', 'bts', 'dut', 'diplôme']
+    edu_found = [kw for kw in edu_keywords if kw in text.lower()]
+    education = ", ".join(edu_found) if edu_found else "Non spécifié"
+    
+    return skills, experience, education
 
-def extract_experience(text):
-    match = re.search(r'(\d+(?:\.\d+)?)\s*(?:ans|années?)', text, re.I)
-    return str(match.group(1)) if match else "0"
-
-def parse_cv_file(file_path):
-    ext = os.path.splitext(file_path)[1].lower()
+def parse_cv_file(filepath):
+    """Point d'entrée principal : extrait le texte, les compétences, l'expérience"""
+    ext = os.path.splitext(filepath)[1].lower()
     if ext == '.pdf':
-        raw_text = parse_pdf(file_path)
+        text = parse_pdf(filepath)
     elif ext == '.docx':
-        raw_text = parse_docx(file_path)
+        text = parse_docx(filepath)
     elif ext in ['.jpg', '.jpeg', '.png']:
-        raw_text = parse_image(file_path)
+        text = parse_image(filepath)
     else:
-        raw_text = ""
-    skills = extract_skills(raw_text)
-    exp = extract_experience(raw_text)
-    education = ""  # à améliorer
-    return raw_text, skills, exp, education
+        text = ""
+    
+    skills, exp, edu = extract_skills_experience_education(text)
+    return text, skills, exp, edu
