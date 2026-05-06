@@ -2,7 +2,7 @@ import os
 import json
 import re
 import unicodedata
-from datetime import date
+from datetime import date, datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -31,7 +31,7 @@ DB_CONFIG = {
 }
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-# -------------------- PROMPT SYSTÈME --------------------
+# -------------------- PROMPT SYSTÈME AVEC RÈGLE SIGNE --------------------
 DEEPSEEK_SYSTEM_PROMPT = """
 Tu es un expert senior en recrutement avec 15 ans d'expérience en analyse de CVs et en matching candidat/poste.
 
@@ -124,6 +124,14 @@ E) ANNÉES D'EXPÉRIENCE
        - Écart de 5 ans+  : disqualifier (score = 0)
    - Si aucune durée n'est mentionnée dans la requête → ignorer ce critère.
 
+F) SIGNE ASTROLOGIQUE
+   - Si la requête mentionne explicitement un signe (Bélier, Taureau, Gémeaux, Cancer,
+     Lion, Vierge, Balance, Scorpion, Sagittaire, Capricorne, Verseau, Poissons),
+     ce critère est OBLIGATOIRE.
+   - Si le signe du candidat ne correspond pas → score = 0,
+     recommandation = "non recommandé".
+   - Si aucun signe n'est mentionné dans la requête → ignorer ce critère.
+
 ========================================
 ÉTAPE 2 — SCORING DE BASE
 ========================================
@@ -177,10 +185,10 @@ Score final doit rester entre 0 et 100.
 ========================================
 ÉTAPE 4 — DÉTERMINATION DE LA RECOMMANDATION
 ========================================
-- Score ≥ 75 et aucun critère bloquant (genre)  → "fort recommandé"
+- Score ≥ 75 et aucun critère bloquant (genre, signe) → "fort recommandé"
 - Score 55-74                                    → "recommandé"
 - Score 35-54                                    → "à considérer"
-- Score < 35 ou genre non correspondant          → "non recommandé"
+- Score < 35 ou genre/signe non correspondant     → "non recommandé"
 
 ========================================
 RÈGLES GÉNÉRALES
@@ -203,11 +211,10 @@ def normalize_text(text):
     return text
 
 def normalize_city(city):
-    """Normalise un nom de ville : minuscules, sans accents, sans tirets, sans espaces."""
     if not city:
         return ""
     city = normalize_text(city)
-    city = re.sub(r'[^a-z]', '', city)  # garde seulement les lettres
+    city = re.sub(r'[^a-z]', '', city)
     return city
 
 def extraire_ville(phrase):
@@ -218,13 +225,48 @@ def extraire_ville(phrase):
             return v
     return None
 
+def signe_astrologique(date_naissance):
+    if not date_naissance:
+        return None
+    jour = date_naissance.day
+    mois = date_naissance.month
+    if (mois == 3 and jour >= 21) or (mois == 4 and jour <= 19):
+        return "Bélier"
+    if (mois == 4 and jour >= 20) or (mois == 5 and jour <= 20):
+        return "Taureau"
+    if (mois == 5 and jour >= 21) or (mois == 6 and jour <= 20):
+        return "Gémeaux"
+    if (mois == 6 and jour >= 21) or (mois == 7 and jour <= 22):
+        return "Cancer"
+    if (mois == 7 and jour >= 23) or (mois == 8 and jour <= 22):
+        return "Lion"
+    if (mois == 8 and jour >= 23) or (mois == 9 and jour <= 22):
+        return "Vierge"
+    if (mois == 9 and jour >= 23) or (mois == 10 and jour <= 22):
+        return "Balance"
+    if (mois == 10 and jour >= 23) or (mois == 11 and jour <= 21):
+        return "Scorpion"
+    if (mois == 11 and jour >= 22) or (mois == 12 and jour <= 21):
+        return "Sagittaire"
+    if (mois == 12 and jour >= 22) or (mois == 1 and jour <= 19):
+        return "Capricorne"
+    if (mois == 1 and jour >= 20) or (mois == 2 and jour <= 18):
+        return "Verseau"
+    return "Poissons"
+
 def deepseek_analyse(texte):
-    """Analyse initiale d'un CV pour extraire les champs structurés (utilisée par /parse_cv)."""
     if not DEEPSEEK_API_KEY:
         return None
     url = "https://api.deepseek.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-    prompt = f"""Analyse le CV et réponds UNIQUEMENT en JSON avec les clés : competences_techniques (liste), certifications (liste), localisation (string), situation_matrimoniale (string), resume (string). CV: {texte[:3000]}"""
+    prompt = f"""Analyse le CV et réponds UNIQUEMENT en JSON avec les clés : 
+- competences_techniques (liste),
+- certifications (liste),
+- localisation (string),
+- situation_matrimoniale (string),
+- resume (string),
+- date_naissance (string au format YYYY-MM-DD, si l'année n'est pas précisée, utilise 2000. Exemple: "2000-05-12". Si aucune date trouvée, mets null).
+CV: {texte[:3000]}"""
     payload = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0}
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=30)
@@ -250,6 +292,7 @@ class ChatRequest(BaseModel):
 
 @app.post("/parse_cv")
 async def parse_cv(req: ParseRequest):
+    conn = None
     try:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         full_path = os.path.join(base_dir, 'public_html', req.file_path)
@@ -257,37 +300,57 @@ async def parse_cv(req: ParseRequest):
         deep_data = None
         if text and len(text) > 100 and DEEPSEEK_API_KEY:
             deep_data = deepseek_analyse(text)
+            if deep_data:
+                if "competences_techniques" in deep_data:
+                    skills = ", ".join(deep_data["competences_techniques"])
+                if "experience_annees" in deep_data:
+                    exp = str(deep_data["experience_annees"])
         conn = get_db()
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE cvs SET extracted_text=%s, extracted_skills=%s, extracted_experience=%s,
                 extracted_education=%s, extraction_status='done', deepseek_analysis=%s WHERE id=%s
             """, (text, skills, exp, edu, json.dumps(deep_data), req.cv_id))
+            if deep_data and deep_data.get('date_naissance'):
+                date_str = deep_data['date_naissance']
+                try:
+                    datetime.strptime(date_str, '%Y-%m-%d')
+                    cur.execute("""
+                        UPDATE candidates 
+                        SET birth_date = %s 
+                        WHERE user_id = (SELECT user_id FROM cvs WHERE id = %s)
+                    """, (date_str, req.cv_id))
+                except ValueError:
+                    print(f"Date invalide ignorée : {date_str}")
             conn.commit()
-        conn.close()
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
 
 @app.post("/search")
 async def search(req: SearchRequest):
-    conn = get_db()
+    conn = None
     try:
+        conn = get_db()
         raw_query = req.query.strip()
+        print(f"Requête reçue : '{raw_query}'")
         if not raw_query:
             return {"results": []}
 
         # --- FILTRE VILLE ---
         ville_demandee = extraire_ville(raw_query)
         if ville_demandee:
-            print(f"Filtrage par ville : {ville_demandee}")
+            print(f"Ville demandée normalisée : '{ville_demandee}'")
 
-        # Récupérer tous les CV analysés
+        # Récupérer tous les CV analysés (inclure file_path)
         cur = conn.cursor(pymysql.cursors.DictCursor)
         cur.execute("""
             SELECT u.id as user_id, c.full_name, c.city, c.birth_date, c.gender,
                    c.experience_years, cv.extracted_text, cv.extracted_skills,
-                   cv.deepseek_analysis
+                   cv.deepseek_analysis, cv.file_path
             FROM users u
             JOIN candidates c ON u.id = c.user_id
             JOIN cvs cv ON u.id = cv.user_id
@@ -295,28 +358,67 @@ async def search(req: SearchRequest):
         """)
         candidates = cur.fetchall()
         cur.close()
-        conn.close()
+
+        # --- DIAGNOSTIC : afficher toutes les villes avant filtre ---
+        print("=== Villes des candidats (brutes et normalisées) ===")
+        for c in candidates:
+            raw_city = c.get('city')
+            norm_city = normalize_city(raw_city) if raw_city else None
+            print(f"Candidat: {c['full_name']}, city brute: '{raw_city}', normalisée: '{norm_city}'")
 
         # Appliquer le filtre ville (normalisation stricte)
         if ville_demandee:
-            candidates = [c for c in candidates if c['city'] and normalize_city(c['city']) == ville_demandee]
+            print(f"Filtrage sur ville normalisée : '{ville_demandee}'")
+            filtered_candidates = []
+            for c in candidates:
+                city_norm = normalize_city(c.get('city')) if c.get('city') else None
+                if city_norm == ville_demandee:
+                    filtered_candidates.append(c)
+                    print(f"  -> CONSERVÉ : {c['full_name']} (city_norm='{city_norm}')")
+                else:
+                    print(f"  -> EXCLU : {c['full_name']} (city_norm='{city_norm}')")
+            candidates = filtered_candidates
+        else:
+            print("Aucun filtre ville appliqué (ville non détectée dans la requête)")
 
         if not candidates:
+            print("Aucun candidat après filtre ville")
             return {"results": []}
 
-        results = []
+        # Dictionnaire pour stocker le meilleur résultat par user_id
+        best_by_user = {}
         today = date.today()
+        signes_liste = ['bélier','taureau','gémeaux','cancer','lion','vierge','balance','scorpion','sagittaire','capricorne','verseau','poissons']
+
         for cand in candidates:
             deep = json.loads(cand['deepseek_analysis']) if cand['deepseek_analysis'] else {}
 
             age = None
+            signe = None
             if cand.get('birth_date'):
                 birth = cand['birth_date']
                 age = today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
+                signe = signe_astrologique(birth)
 
+            # Détection du signe demandé
+            signe_demande = None
+            raw_lower = raw_query.lower()
+            for s in signes_liste:
+                if s in raw_lower:
+                    signe_demande = s.capitalize()
+                    break
+
+            print(f"Candidat: {cand['full_name']}, birth_date: {cand.get('birth_date')}, signe calculé: {signe}, signe demandé: {signe_demande}")
+
+            if signe_demande and signe != signe_demande:
+                print("Exclusion car signe ne correspond pas")
+                continue
+
+            # Construction du profil pour DeepSeek
             profil = {
                 "genre": cand.get('gender') or "",
                 "age": age if age is not None else "",
+                "signe": signe if signe else "",
                 "ville": cand.get('city') or "",
                 "experience_annees": cand.get('experience_years') or 0,
                 "competences_techniques": deep.get('competences_techniques', []),
@@ -335,6 +437,7 @@ FILTRE optionnel : (aucun pour l'instant)
 PROFIL CANDIDAT :
 - Genre : {profil['genre'] if profil['genre'] else 'Non spécifié'}
 - Âge : {profil['age'] if profil['age'] else 'Non renseigné'}
+- Signe astrologique : {profil['signe'] if profil['signe'] else 'Non renseigné'}
 - Ville : {profil['ville'] if profil['ville'] else 'Non renseignée'}
 - Années d'expérience : {profil['experience_annees']}
 - Compétences techniques : {', '.join(profil['competences_techniques'])}
@@ -369,28 +472,36 @@ PROFIL CANDIDAT :
             if score < 20:
                 continue
 
-            results.append({
-                "user_id": cand['user_id'],
-                "full_name": cand['full_name'],
-                "score": score,
-                "justification": score_data.get('justification', ''),
-                "points_forts": score_data.get('points_forts', ''),
-                "points_faibles": score_data.get('points_faibles', ''),
-                "competences_detectees": score_data.get('competences_detectees', ''),
-                "niveau_experience": score_data.get('niveau_experience', ''),
-                "recommandation": score_data.get('recommandation', ''),
-                "city": cand.get('city', 'Non renseignée'),
-                "skills": ", ".join(profil['competences_techniques']),
-                "experience_years": profil['experience_annees'],
-                "experience_years_display": str(int(profil['experience_annees'])) if profil['experience_annees'] == int(profil['experience_annees']) else str(profil['experience_annees']),
-                "resume": profil['resume']
-            })
+            uid = cand['user_id']
+            # Mise à jour du meilleur score (et conservation du file_path associé)
+            if uid not in best_by_user or score > best_by_user[uid]['score']:
+                best_by_user[uid] = {
+                    'score': score,
+                    'full_name': cand['full_name'],
+                    'city': cand.get('city', 'Non renseignée'),
+                    'skills': ", ".join(profil['competences_techniques']),
+                    'experience_years': profil['experience_annees'],
+                    'experience_years_display': str(int(profil['experience_annees'])) if profil['experience_annees'] == int(profil['experience_annees']) else str(profil['experience_annees']),
+                    'resume': profil['resume'],
+                    'file_path': cand['file_path'],
+                    'justification': score_data.get('justification', ''),
+                    'points_forts': score_data.get('points_forts', ''),
+                    'points_faibles': score_data.get('points_faibles', ''),
+                    'competences_detectees': score_data.get('competences_detectees', ''),
+                    'niveau_experience': score_data.get('niveau_experience', ''),
+                    'recommandation': score_data.get('recommandation', '')
+                }
 
+        # Construction des résultats à partir du meilleur de chaque candidat
+        results = list(best_by_user.values())
         results.sort(key=lambda x: x['score'], reverse=True)
         return {"results": results}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
 
 @app.post("/chat")
 async def chat(req: ChatRequest):

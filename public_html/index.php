@@ -28,7 +28,7 @@
                 <a href="candidate_login.php" class="btn btn-primary btn-lg mt-2"><i class="fas fa-upload"></i> Déposer mon CV</a>
             </div>
             <div class="col-md-6 text-center">
-                <img src="https://via.placeholder.com/500x400?text=Illustration+IA" class="img-fluid rounded shadow" alt="IA">
+                <img src="https://images.unsplash.com/photo-1581091226033-d5c48150dbaa?w=600&h=400&fit=crop" class="img-fluid rounded shadow" alt="IA">
             </div>
         </div>
     </div>

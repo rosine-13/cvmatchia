@@ -21,26 +21,7 @@ $analyzedCVs = $stmt->fetchColumn();
         .result-card { border-left: 5px solid #0d6efd; margin-bottom: 20px; transition: transform 0.2s; }
         .result-card:hover { transform: translateY(-5px); }
         .stat-card { border-radius: 15px; }
-        .chat-floating-btn {
-            position: fixed;
-            bottom: 30px;
-            right: 30px;
-            width: 60px;
-            height: 60px;
-            border-radius: 50%;
-            background-color: #0d6efd;
-            color: white;
-            border: none;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-            font-size: 28px;
-            cursor: pointer;
-            z-index: 1000;
-            transition: transform 0.2s, background-color 0.2s;
-        }
-        .chat-floating-btn:hover {
-            background-color: #0b5ed7;
-            transform: scale(1.05);
-        }
+        /* Le style du bouton flottant n'est plus utilisé, mais on le garde pour ne pas casser */
     </style>
 </head>
 <body class="bg-light">
@@ -95,13 +76,13 @@ $analyzedCVs = $stmt->fetchColumn();
         <div id="results" class="row"></div>
     </div>
 
-    <!-- Bouton flottant pour l'agent conversationnel -->
-    <button class="chat-floating-btn" id="openChatBtn" title="Agent IA conversationnel">
+    <!-- Bouton flottant pour l'agent conversationnel (désactivé) -->
+    <!-- <button class="chat-floating-btn" id="openChatBtn" title="Agent IA conversationnel">
         <i class="fas fa-comment-dots"></i>
-    </button>
+    </button> -->
 
-    <!-- Modal Agent conversationnel -->
-    <div class="modal fade" id="chatModal" tabindex="-1">
+    <!-- Modal Agent conversationnel (désactivé) -->
+    <!-- <div class="modal fade" id="chatModal" tabindex="-1">
         <div class="modal-dialog">
             <div class="modal-content">
                 <div class="modal-header bg-dark text-white">
@@ -119,7 +100,7 @@ $analyzedCVs = $stmt->fetchColumn();
                 </div>
             </div>
         </div>
-    </div>
+    </div> -->
 
     <!-- Modal Envoyer un email -->
     <div class="modal fade" id="emailModal" tabindex="-1">
@@ -224,6 +205,8 @@ $analyzedCVs = $stmt->fetchColumn();
             container.innerHTML = html;
         }
 
+        // Fonctions liées à l'agent conversationnel (désactivées)
+        /*
         function openChatModal() {
             const modal = new bootstrap.Modal(document.getElementById('chatModal'));
             modal.show();
@@ -236,24 +219,9 @@ $analyzedCVs = $stmt->fetchColumn();
         document.getElementById('btnChatSend')?.addEventListener('click', async () => {
             const userMsg = document.getElementById('chatInput').value;
             if (!userMsg) return;
-            const response = await fetch('admin_chat_ajax.php', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    original_query: window.currentQuery,
-                    user_message: userMsg,
-                    current_ids: window.currentIds
-                })
-            });
-            const data = await response.json();
-            document.getElementById('chatResponse').innerHTML = `<i class="fas fa-robot"></i> ${data.message}`;
-            if (data.filtered_ids) {
-                const filteredResults = lastResults.filter(r => data.filtered_ids.includes(r.user_id));
-                displayResults(filteredResults);
-                lastResults = filteredResults;
-                window.currentIds = data.filtered_ids;
-            }
+            ...
         });
+        */
 
         function openEmailModal(userId, fullName) {
             document.getElementById('emailUserId').value = userId;
